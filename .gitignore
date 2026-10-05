@@ -1,0 +1,28 @@
+# 视频 / 音频素材：自己准备，别提交上来
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.flv
+*.webm
+*.ts
+*.wmv
+*.m4v
+*.mp3
+*.wav
+*.flac
+
+# 字幕素材：可能有版权，别提交（examples/ 里的演示字幕除外）
+*.srt
+*.lrc
+*.ass
+*.ssa
+!examples/*.srt
+
+# 本机配置和临时文件
+led_player.ini
+_selftest*
+push_github.cmd
+__pycache__/
+*.py[cod]
+*.log

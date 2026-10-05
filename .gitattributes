@@ -1,0 +1,7 @@
+# 统一换行符：仓库里存 LF，Windows 上检出成 CRLF
+* text=auto
+*.py   text eol=lf
+*.md   text eol=lf
+*.srt  text eol=lf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
