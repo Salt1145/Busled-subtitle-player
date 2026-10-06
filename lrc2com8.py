@@ -32,9 +32,17 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from led_screen import (DEFAULT_BAUD, DEFAULT_MARQUEE_STEP_MS, DEFAULT_MIN_SEG_MS,
-                        DEFAULT_TYPE_STEP_MS, FULLWIDTH_WIDTH, LEDScreen,
-                        SubtitleEngine, build_events, find_subtitle, list_ports,
-                        load_subtitles, text_slots)
+                        DEFAULT_TYPE_STEP_MS, FULLWIDTH_WIDTH, KIND_LABELS,
+                        LEDScreen, SubtitleEngine, analyze_subtitles, build_events,
+                        find_subtitle, list_ports, load_subtitles,
+                        merge_incremental, resolve_offset, shift_cues, text_slots)
+
+
+def _fmt_ms(ms):
+    s = max(0, ms) / 1000.0
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    return "%d:%02d:%02d" % (h, m, int(s % 60)) if h else "%d:%02d" % (m, int(s % 60))
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -77,6 +85,10 @@ def main(argv=None):
     ap.add_argument("--typewriter", nargs="?", const="auto", default="off",
                     choices=["auto", "always"],
                     help="打字机效果：auto=来得及才打字 always=总是打字（不给这个参数就是关）")
+    ap.add_argument("--analyze", action="store_true",
+                    help="分析这份字幕本身是不是增量/滚动（自带打字机/横移）式，分析完退出")
+    ap.add_argument("--merge-incremental", action="store_true",
+                    help="把 我/我要/我要玩 这种增量碎片合并成整句，再交给播放器自己演")
     ap.add_argument("--type-step", type=int, default=DEFAULT_TYPE_STEP_MS,
                     help="打字机每个字最短间隔毫秒，默认 %d" % DEFAULT_TYPE_STEP_MS)
     ap.add_argument("--no-marquee", dest="marquee", action="store_false", default=True,
@@ -84,6 +96,9 @@ def main(argv=None):
     ap.add_argument("--marquee-step", type=int, default=DEFAULT_MARQUEE_STEP_MS,
                     help="横移每格最短间隔毫秒，默认 %d" % DEFAULT_MARQUEE_STEP_MS)
     ap.add_argument("--start", default=None, help="从第几秒开始（1:23 或 83）")
+    ap.add_argument("--offset", default="0",
+                    help="字幕时间偏移：auto=把第一句对齐到 0（字幕跟视频对不上时用）；"
+                         "也可填 -1:32:35 / +2.5")
     ap.add_argument("--speed", type=float, default=1.0, help="倍速（测试用，2 就是 2 倍速发送）")
     ap.add_argument("--dry-run", action="store_true", help="不开串口，只打印")
     ap.add_argument("--list", action="store_true", help="列出切分后的事件表，不发送")
@@ -104,11 +119,44 @@ def main(argv=None):
         print("找不到字幕文件（.srt / .lrc），用 --file 指定")
         return 2
 
-    cues = load_subtitles(sub_path)
-    if not cues:
+    cues_raw = load_subtitles(sub_path)
+    if not cues_raw:
         print("字幕文件里没解析出内容：%s" % sub_path)
         return 2
-    print("字幕: %s (%d 句)" % (os.path.basename(sub_path), len(cues)))
+    print("字幕: %s (%d 句)" % (os.path.basename(sub_path), len(cues_raw)))
+
+    # 先看看这份字幕本身是不是"动画字幕"
+    ana = analyze_subtitles(cues_raw)
+    if ana["animated"] or ana["advice"]:
+        print("字幕类型: %s（相邻句里 %s %d 处 / %s %d 处 / 时间相接的动画 %d 处，占 %.1f%%）"
+              % (ana["verdict"], KIND_LABELS["grow"], ana["counts"]["grow"],
+                 KIND_LABELS["scroll"], ana["counts"]["scroll"],
+                 ana["animated"], ana["ratio"] * 100))
+        if ana["advice"]:
+            print("建议: %s" % ana["advice"])
+    if args.analyze:
+        print("相邻句关系统计: " + " / ".join(
+            "%s %d" % (KIND_LABELS[k], v) for k, v in ana["counts"].items() if v))
+        for idx, t1, t2, r in ana["sample"]:
+            print("  第 %d 句: %-24s -> %-24s [%s%s]"
+                  % (idx + 1, t1[:24], t2[:24], KIND_LABELS[r["kind"]],
+                     (" 新增" + r["delta"]) if r["delta"] and r["kind"] == "grow" else
+                     (" 左移%d字" % r["shift"]) if r["shift"] else ""))
+        return 0
+
+    if args.merge_incremental:
+        before = len(cues_raw)
+        cues_raw, away = merge_incremental(cues_raw)
+        print("增量合并: %d 句 -> %d 句（合并掉 %d 句碎片）" % (before, len(cues_raw), away))
+
+    off = resolve_offset(args.offset, cues_raw, 0)
+    cues = shift_cues(cues_raw, off)
+    if off:
+        print("时间偏移: %+d ms —— 第一句 %s -> %s（剩 %d 句）"
+              % (off, _fmt_ms(cues_raw[0][0]), _fmt_ms(cues[0][0]) if cues else "-", len(cues)))
+    elif cues_raw[0][0] > 30000:
+        print("提示: 字幕第一句在 %s 才开始，前面不会有字幕；想整体提前就加 --offset auto"
+              % _fmt_ms(cues_raw[0][0]))
 
     logs = []
     width = args.width_fw * 2 if args.width_fw else args.width

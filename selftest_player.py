@@ -210,6 +210,10 @@ def main():
     step(8.5, "width 9 全角字", lambda: (app.var_width_fw.set("9"), app.on_width_change()))
     step(9.0, "横移 关", lambda: (app.var_marquee.set(False), app.on_marquee_toggle()))
     step(9.5, "横移 开", lambda: (app.var_marquee.set(True), app.on_marquee_toggle()))
+    step(9.8, "合并增量字幕 开", lambda: (app.var_merge_inc.set(True), app.on_merge_toggle()))
+    step(10.2, "字幕偏移 +3s", lambda: (app.var_offset.set("+3"), app.on_offset_change()))
+    step(10.5, "字幕偏移 归零", lambda: (app.var_offset.set("0"), app.on_offset_change()))
+    step(10.8, "合并增量字幕 关", lambda: (app.var_merge_inc.set(False), app.on_merge_toggle()))
     step(10.0, "restart from head", app.on_restart)
     step(11.0, "seek to 70%", lambda: (app.var_scale.set(max(1, app.duration_ms) * 0.7),
                                        app.on_scale_press(None), app.on_scale_release(None)))

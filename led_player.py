@@ -40,10 +40,10 @@ from tkinter import filedialog, messagebox, ttk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from led_screen import (DEFAULT_BAUD, DEFAULT_MIN_SEG_MS, DEFAULT_TYPE_STEP_MS,
-                        FULLWIDTH_WIDTH, LEDScreen, SubtitleEngine, build_events,
-                        find_subtitle, find_video, fit_slots, fw_to_slots,
-                        list_ports, load_subtitles, sanitize, slots_to_fw,
-                        text_slots)
+                        FULLWIDTH_WIDTH, LEDScreen, SubtitleEngine, analyze_subtitles,
+                        build_events, find_subtitle, find_video, fit_slots, fw_to_slots,
+                        list_ports, load_subtitles, merge_incremental, parse_time_ms,
+                        resolve_offset, sanitize, shift_cues, slots_to_fw, text_slots)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INI_PATH = os.path.join(SCRIPT_DIR, "led_player.ini")
@@ -94,7 +94,22 @@ def fmt_time(ms):
     if ms is None or ms < 0:
         ms = 0
     s = ms / 1000.0
-    return "%d:%02d" % (int(s // 60), int(s % 60))
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    return "%d:%02d:%02d" % (h, m, sec) if h else "%d:%02d" % (m, sec)
+
+
+def fmt_offset(ms, signed=False):
+    """偏移量写成 -1:32:35.2 这种看得懂的样子"""
+    sign = "-" if ms < 0 else ("+" if signed else "")
+    ms = abs(int(ms))
+    h, rem = divmod(ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, _ = divmod(rem, 1000)
+    if h:
+        return "%s%d:%02d:%02d" % (sign, h, m, s)
+    return "%s%d:%02d" % (sign, m, s)
 
 
 def find_ffplay():
@@ -430,6 +445,7 @@ class LedPlayerApp:
         self.engine = None
         self.ff = None
         self.cues = []
+        self.cues_raw = []              # 没加偏移的原始字幕，改偏移时从它重算
         self.events = []
         self.duration_ms = 0
         self.send_count = 0
@@ -474,6 +490,8 @@ class LedPlayerApp:
             d["marquee"] = p.get("marquee", "1")
             d["width_fw"] = p.get("width_fw", "") or str(
                 slots_to_fw(p.get("width", FULLWIDTH_WIDTH) or FULLWIDTH_WIDTH))
+            d["offset"] = p.get("offset", "0")
+            d["merge_inc"] = p.get("merge_inc", "0")
         return d
 
     def load_cfg(self):
@@ -631,6 +649,16 @@ class LedPlayerApp:
         ttk.Label(mq, text="  关掉就是老做法：切成 2/3 段或截断", foreground="#666").pack(side="left")
         row += 1
 
+        ttk.Label(f, text="增量字幕").grid(row=row, column=0, sticky="w", pady=4)
+        mi = ttk.Frame(f)
+        mi.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
+        self.var_merge_inc = tk.BooleanVar(value=v.get("merge_inc", "0") == "1")
+        ttk.Checkbutton(mi, text="合并增量字幕（字幕本身是 我 / 我要 / 我要玩 这种碎片时，"
+                                 "合并成整句再让播放器演）",
+                        variable=self.var_merge_inc,
+                        command=self.on_merge_toggle).pack(side="left")
+        row += 1
+
         ttk.Label(f, text="每字最短间隔(ms)").grid(row=row, column=0, sticky="w", pady=4)
         tw2 = ttk.Frame(f)
         tw2.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
@@ -679,6 +707,21 @@ class LedPlayerApp:
             row=row, column=1, sticky="w", pady=4)
         ttk.Label(f, text="可填 0 / 83 / 1:23", foreground="#666").grid(
             row=row, column=2, sticky="w")
+        row += 1
+
+        # 字幕时间偏移（字幕跟视频对不上时用）
+        ttk.Label(f, text="字幕时间偏移").grid(row=row, column=0, sticky="w", pady=4)
+        off = ttk.Frame(f)
+        off.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
+        self.var_offset = tk.StringVar(value=v.get("offset") or "0")
+        e_off = ttk.Entry(off, textvariable=self.var_offset, width=12)
+        e_off.grid(row=0, column=0, sticky="w")
+        e_off.bind("<Return>", lambda _e: self.on_offset_change())
+        e_off.bind("<FocusOut>", lambda _e: self.on_offset_change())
+        ttk.Button(off, text="对齐到 0", command=self.on_align_offset).grid(
+            row=0, column=1, padx=6)
+        ttk.Label(off, text='  auto=把第一句拉到 0；也可填 -1:32:35 / +2.5',
+                  foreground="#666").grid(row=0, column=2, sticky="w")
         row += 1
 
         # 按钮
@@ -878,6 +921,8 @@ class LedPlayerApp:
         v["typewriter"] = self.typewriter_mode()
         v["type_step"] = str(self._int(self.var_type_step.get(), DEFAULT_TYPE_STEP_MS))
         v["marquee"] = "1" if self.var_marquee.get() else "0"
+        v["offset"] = (self.var_offset.get() or "0").strip() or "0"
+        v["merge_inc"] = "1" if self.var_merge_inc.get() else "0"
         return v
 
     def typewriter_mode(self):
@@ -897,6 +942,91 @@ class LedPlayerApp:
             self.rebuild_events()
             self.log("每行宽度改为 %s 全角字（%s 槽），已按新宽度重排"
                      % (self.var_width_fw.get(), self.cfg_values.get("width")),
+                     to_console=True)
+
+    # ---- 字幕时间偏移：字幕跟视频对不上时的救命开关 ----
+
+    def apply_offset(self, log_it=False):
+        """
+        按「字幕时间偏移」把整条字幕时间轴平移。
+        auto / -1:32:35 / +2.5 都行；播放中改也能立刻生效。
+        """
+        raw = getattr(self, "cues_raw", None) or []
+        text = (self.var_offset.get() or "0").strip()
+        off = resolve_offset(text, raw, self.duration_ms)
+        self.cues = shift_cues(raw, off)
+        if self.engine:
+            self.rebuild_events()
+        if log_it and raw:
+            if off:
+                self.log("字幕时间偏移 %s：第一句 %s → %s（共 %d 句，偏移后剩 %d 句）"
+                         % (fmt_offset(off), fmt_time(raw[0][0]), fmt_time(self.cues[0][0])
+                            if self.cues else "-", len(raw), len(self.cues)), to_console=True)
+            else:
+                self.log("字幕时间偏移 0（第一句 %s）" % fmt_time(raw[0][0]), to_console=True)
+        return off
+
+    def on_align_offset(self):
+        """「对齐到 0」：把字幕第一句挪到 0，并把具体数值填进输入框（看得见、可再手调）"""
+        sub = self.resolve_path(self.var_sub.get().strip())
+        if not sub:
+            self.lbl_cfg_hint.config(text="先选好字幕文件再对齐", foreground="#a00")
+            return
+        try:
+            cues = load_subtitles(sub)
+        except Exception as e:
+            self.lbl_cfg_hint.config(text="字幕读不了：%s" % e, foreground="#a00")
+            return
+        if not cues:
+            self.lbl_cfg_hint.config(text="字幕里没有可用内容", foreground="#a00")
+            return
+        off = -cues[0][0]
+        self.var_offset.set(fmt_offset(off, signed=True))
+        self.lbl_cfg_hint.config(
+            text="已填偏移 %s：第一句 %s → 0:00（全片 %d 句）"
+                 % (fmt_offset(off, signed=True), fmt_time(cues[0][0]), len(cues)),
+            foreground="#070")
+        if self.cues_raw:
+            self.apply_offset(log_it=True)
+
+    def on_offset_change(self):
+        self.collect_config()
+        self.save_cfg()
+        if self.cues_raw:
+            self.apply_offset(log_it=True)
+
+    # ---- 增量字幕：字幕自己就是 我/我要/我要玩 这种碎片时，可选合并成整句 ----
+
+    def prepare_cues(self, log_it=True):
+        """
+        从原始字幕出发：可选「合并增量字幕」-> 时间偏移 -> 得到 self.cues。
+        播放中调用会立刻重排。
+        """
+        src = list(getattr(self, "file_cues", []) or [])
+        if src and self.var_merge_inc.get():
+            src, away = merge_incremental(src)
+            if log_it:
+                self.log("增量合并：合并掉 %d 句碎片（我/我要/我要玩 → 我要玩原神），剩 %d 句"
+                         % (away, len(src)), to_console=True)
+        self.cues_raw = src
+        return self.apply_offset(log_it=log_it)
+
+    def on_merge_toggle(self):
+        self.collect_config()
+        self.save_cfg()
+        if self.file_cues:
+            self.prepare_cues(log_it=True)
+
+    def report_subtitle_type(self, cues):
+        """看看这份字幕本身是不是动画字幕，是就提示一句"""
+        try:
+            ana = analyze_subtitles(cues)
+        except Exception:
+            return
+        if ana["animated"] and ana["advice"]:
+            self.log("字幕检查：%s（相邻句里增量 %d 处 / 滚动 %d 处，时间相接的动画 %d 处，占 %.1f%%）。%s"
+                     % (ana["verdict"], ana["counts"]["grow"], ana["counts"]["scroll"],
+                        ana["animated"], ana["ratio"] * 100, ana["advice"]),
                      to_console=True)
 
     @staticmethod
@@ -985,7 +1115,12 @@ class LedPlayerApp:
 
         # 解析字幕 -> 事件表
         try:
-            self.cues = load_subtitles(sub)
+            self.file_cues = load_subtitles(sub)
+            if not self.file_cues:
+                messagebox.showerror(APP_TITLE, "字幕文件里没解析出内容")
+                return
+            self.report_subtitle_type(self.file_cues)
+            self.prepare_cues(log_it=True)
             logs = []
             self.events = self.rebuild_events(logs)
         except Exception as e:
@@ -994,6 +1129,12 @@ class LedPlayerApp:
         if not self.events:
             messagebox.showerror(APP_TITLE, "字幕里没有可用内容")
             return
+        # 字幕整体跑到很后面去了？提醒一句（这十有八九是字幕和视频对不上）
+        off_ms = resolve_offset(v["offset"], self.cues_raw, self.duration_ms)
+        if not off_ms and self.cues_raw[0][0] > 30000:
+            self.log("提示：字幕第一句在 %s 才开始，如果视频比它短，前面都不会有字幕——"
+                     "把「字幕时间偏移」填 auto（或点「对齐到 0」）就能把整条时间轴拉到开头"
+                     % fmt_time(self.cues_raw[0][0]), to_console=True)
 
         # 打开串口（先开，免得倒计时完才发现串口打不开）
         try:

@@ -512,6 +512,211 @@ def load_subtitles(path):
     return parse_srt(path)
 
 
+# ---- 时间轴工具：解析 "1:32:35" / "92.5" / "-1:32:35" 这类写法 ----
+
+def parse_time_ms(text, default=0):
+    """'1:32:35' / '92.5' / '-1:32:35' / '+3' / '' -> 毫秒"""
+    if text is None:
+        return default
+    s = str(text).strip()
+    if not s:
+        return default
+    sign = 1
+    if s[0] in "+-":
+        if s[0] == "-":
+            sign = -1
+        s = s[1:].strip()
+    try:
+        if ":" in s:
+            sec = 0.0
+            for part in s.split(":"):
+                sec = sec * 60 + float(part)
+            return int(sign * sec * 1000)
+        return int(sign * float(s) * 1000)
+    except ValueError:
+        return default
+
+
+def shift_cues(cues, offset_ms):
+    """整条字幕时间轴平移（可负）。负偏移之后整句跑到 0 之前的，直接丢掉。"""
+    if not offset_ms:
+        return list(cues)
+    out = []
+    for start, end, text in cues:
+        s2, e2 = start + offset_ms, end + offset_ms
+        if e2 <= 0:
+            continue
+        out.append((max(0, s2), max(0, e2), text))
+    return out
+
+
+def resolve_offset(text, cues, video_ms=0):
+    """
+    把界面/命令行里填的偏移量变成毫秒：
+      'auto'  -> 自动对齐（把第一句挪到 0；如果第一句已经在视频里，就挪到视频起点）
+      '1:32:35' / '-92.5' / '92.5' -> 直接当偏移量
+      空 -> 0
+    """
+    s = str(text or "").strip().lower()
+    if s in ("auto", "自动", "对齐", "对齐到0", "align"):
+        if not cues:
+            return 0
+        first = cues[0][0]
+        # 字幕整体跑到视频后面去了 -> 拉到 0；否则对齐到视频起点
+        if video_ms and first > video_ms:
+            return -first
+        return -first if first > 30000 else 0
+    return parse_time_ms(text, 0)
+
+
+# --------------------------------------------------------------------------
+# 四点五、相邻字幕关系分析：这句是不是"增量字幕 / 滚动字幕"
+#
+# 有些字幕文件本身就把动画做进去了，相邻两句是这样的：
+#     我 -> 我要 -> 我要玩 -> 我要玩原神                 （增量 / 打字机式）
+#     我要玩原神明朝攫取零啊啊 -> 要玩原神明朝攫取零啊啊啊   （滚动 / 横移式）
+# 判断出来之后可以：① 提示"别再叠加播放器自己的打字机/横移" ② 把碎片合并成整句
+# --------------------------------------------------------------------------
+
+def _norm_text(s):
+    """比较前先归一化：去掉首尾空白，中间连续空白压成一个"""
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _lcp(a, b):
+    """最长公共前缀的长度"""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _lcs(a, b):
+    """最长公共后缀的长度"""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[len(a) - 1 - i] == b[len(b) - 1 - i]:
+        i += 1
+    return i
+
+
+def classify_pair(a, b, gap_ms=None, contiguity_ms=400):
+    """
+    判断相邻两句字幕的关系（a 在前，b 在后）：
+
+      same      两句完全一样（重复）
+      grow      b 是在 a 后面接着长出来的，a 是 b 的前缀   -> 增量字幕（字幕自带打字机）
+      shrink    b 是 a 的前缀，内容在变少                   -> 逐字消失 / 收尾
+      scroll    b 像是 a 往左滚了 k 个字（a 去掉开头 k 个字就是 b 的开头）-> 字幕自带横移
+      similar   公共前后缀很长，多半是同一句的小改动（标点、错字）
+      unrelated 没关系
+
+    另外给一个 contiguous：两句在时间上是不是紧挨着（gap <= contiguity_ms 或重叠），
+    只有"文字增量 + 时间相接"才算真的自带动画，光文字像不算数。
+    """
+    A, B = _norm_text(a), _norm_text(b)
+    res = {"kind": "unrelated", "delta": "", "shift": 0,
+           "lcp": _lcp(A, B), "lcs": _lcs(A, B), "gap_ms": gap_ms,
+           "contiguous": (gap_ms is not None and gap_ms <= contiguity_ms)}
+    if not A or not B:
+        return res
+    if A == B:
+        res["kind"] = "same"
+        return res
+    if B.startswith(A):                       # 我 -> 我要
+        res["kind"] = "grow"
+        res["delta"] = B[len(A):]
+        return res
+    if A.startswith(B):                       # 我要玩 -> 我要
+        res["kind"] = "shrink"
+        res["delta"] = A[len(B):]
+        return res
+    for k in range(1, min(len(A), 8) + 1):    # 我要玩原神明朝 -> 要玩原神明朝攫
+        if len(A) - k >= 2 and B.startswith(A[k:]):
+            res["kind"] = "scroll"
+            res["shift"] = k
+            res["delta"] = B[len(A) - k:]
+            return res
+    m = min(len(A), len(B))
+    if res["lcp"] >= max(3, int(m * 0.6)) or res["lcs"] >= max(3, int(m * 0.6)):
+        res["kind"] = "similar"
+    return res
+
+
+INCREMENTAL_KINDS = ("grow", "shrink", "scroll")
+KIND_LABELS = {"same": "重复", "grow": "增量", "shrink": "递减",
+               "scroll": "滚动", "similar": "相似", "unrelated": "无关"}
+
+
+def analyze_subtitles(cues, contiguity_ms=400, samples=8):
+    """
+    扫一遍整份字幕，看看它本身是不是"动画字幕"。
+    返回 {total, counts, animated, ratio, verdict, advice, sample}
+      animated  文字增量 + 时间相接 的处数（真正自带打字机/横移的）
+    """
+    counts = {k: 0 for k in KIND_LABELS}
+    sample = []
+    animated = 0
+    for i in range(len(cues) - 1):
+        s1, e1, t1 = cues[i]
+        s2, e2, t2 = cues[i + 1]
+        r = classify_pair(t1, t2, gap_ms=s2 - e1, contiguity_ms=contiguity_ms)
+        counts[r["kind"]] += 1
+        if r["kind"] in INCREMENTAL_KINDS and r["contiguous"]:
+            animated += 1
+            if len(sample) < samples:
+                sample.append((i, t1, t2, r))
+    total = max(0, len(cues) - 1)
+    ratio = (animated / total) if total else 0.0
+    grow_like = counts["grow"] + counts["shrink"]
+    # 阈值：长片子按比例，短片子给个 3 处的最低门槛（不然十几句的小文件永远判不出来）
+    if counts["scroll"] >= max(3, total * 0.15):
+        verdict, advice = ("字幕本身是滚动（横移）式",
+                           "建议把播放器的「超长横移」关掉，或者用「合并增量字幕」让它别重复演")
+    elif grow_like >= max(3, total * 0.25):
+        verdict, advice = ("字幕本身是逐字（打字机）式",
+                           "建议把「逐字出现」设成关（字幕自己已经在逐字了），"
+                           "或者勾「合并增量字幕」让播放器重新演一遍")
+    else:
+        verdict, advice = "普通字幕", ""
+    return {"total": total, "counts": counts, "animated": animated,
+            "ratio": ratio, "verdict": verdict, "advice": advice, "sample": sample}
+
+
+def merge_incremental(cues, contiguity_ms=400, max_items=80):
+    """
+    把"一句一句长出来"的碎片合并成整句，交给播放器自己去打字/横移：
+
+        我(0.0-0.5) 我要(0.5-1.0) 我要玩(1.0-1.5) 我要玩原神(1.5-2.5)
+          -> 我要玩原神(0.0-2.5)  外加一个字段记着"这段原本是 4 帧"
+
+    只合并 grow / same 且时间相接的；滚动式、递减式不动（合并了意思会变）。
+    返回 (合并后的 cues, 合并掉的句数)
+    """
+    out = []
+    merged_away = 0
+    i = 0
+    while i < len(cues):
+        start, end, text = cues[i]
+        run = 1
+        j = i + 1
+        while j < len(cues) and run < max_items:
+            s2, e2, t2 = cues[j]
+            r = classify_pair(text, t2, gap_ms=s2 - end, contiguity_ms=contiguity_ms)
+            if r["kind"] in ("grow", "same") and r["contiguous"]:
+                text, end = t2, e2
+                run += 1
+                j += 1
+                continue
+            break
+        if run > 1:
+            merged_away += run - 1
+        out.append((start, end, text))
+        i = j
+    return out, merged_away
+
+
 def _list_by_ext(directory, exts):
     try:
         files = [f for f in os.listdir(directory)
@@ -841,7 +1046,24 @@ def _selftest():
         print("    %6.0fms  %-24s %s" % (ev["t"], ev["text"],
                                          "横移" if ev["scroll"] else "整句"))
 
-    print("\n=== 8. 打字机 + 引擎（干跑，1.5 秒） ===")
+    print("\n=== 8. 相邻句关系：这句是不是增量字幕（自带打字机/横移） ===")
+    for a, b in [("我", "我要"), ("我要玩", "我要玩原神"), ("我要玩原神", "我要玩"),
+                 ("我要玩原神明朝攫取零啊啊", "要玩原神明朝攫取零啊啊啊"),
+                 ("咬着葱 仰望着天空", "泪水滑落而下")]:
+        r = classify_pair(a, b, gap_ms=0)
+        extra = ("新增 " + r["delta"]) if r["delta"] and r["kind"] == "grow" else \
+                ("左移 %d 字" % r["shift"]) if r["shift"] else ""
+        print("    %-20s -> %-20s %-4s %s" % (a[:20], b[:20], KIND_LABELS[r["kind"]], extra))
+    frag = [(0, 500, "我"), (500, 1000, "我要"), (1000, 1500, "我要玩"),
+            (1500, 2500, "我要玩原神"), (3000, 4000, "完全无关的一句")]
+    merged, away = merge_incremental(frag)
+    print("  合并碎片: %d 句 -> %d 句（合并掉 %d）: %s"
+          % (len(frag), len(merged), away, merged))
+    ana = analyze_subtitles(frag)
+    print("  判定: %s（增量 %d 处，占 %.0f%%）"
+          % (ana["verdict"], ana["counts"]["grow"], ana["ratio"] * 100))
+
+    print("\n=== 9. 打字机 + 引擎（干跑，1.5 秒） ===")
     screen2 = LEDScreen(dry_run=True, log=lambda m: print("   ", m))
     eng2 = SubtitleEngine(tw, screen2)
     for t in range(0, 1500, 20):
